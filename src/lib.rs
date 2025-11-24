@@ -1,37 +1,47 @@
-use tokio::sync::{
-    mpsc,
-    oneshot::{self, error::RecvError},
-};
+use async_trait::async_trait;
+use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 
-trait Actor: Send + Sized + 'static {
-    fn start(mut self) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::channel::<Box<dyn Envelope<Self>>>(100);
+#[derive(Error, Debug)]
+pub enum ActorError {
+    #[error("Error receiving message")]
+    ResponseError,
+    #[error("Error sending message")]
+    SendError,
+}
+
+pub trait Actor: Send + Sized + 'static {
+    fn start(self) -> Addr<Self> {
+        let (tx, mut rx) = mpsc::channel::<Box<dyn MsgToProcess<Self>>>(100);
         tokio::spawn(async move {
-            while let Some(mut env) = rx.recv().await {
-                env.process(&mut self);
+            let mut this = self;
+            while let Some(mut msg) = rx.recv().await {
+                msg.process(&mut this).await;
             }
         });
         Addr { tx }
     }
 }
 
-trait Message: Send + 'static {
+pub trait Message: Send + 'static {
     type Response: Send;
 }
 
-trait Handler<M>
+#[async_trait]
+pub trait Handler<M>
 where
     Self: Actor,
     M: Message,
 {
-    fn handle(&mut self, msg: M) -> M::Response;
+    async fn handle(&mut self, msg: M) -> M::Response;
 }
 
-trait Envelope<A>: Send {
-    fn process(&mut self, act: &mut A);
+#[async_trait]
+pub trait MsgToProcess<A>: Send {
+    async fn process(&mut self, act: &mut A);
 }
 
-struct WrappedMessage<M>
+pub struct Envelope<M>
 where
     M: Message,
 {
@@ -39,14 +49,24 @@ where
     pub tx: Option<oneshot::Sender<M::Response>>,
 }
 
-impl<A, M> Envelope<A> for WrappedMessage<M>
+impl<M> Envelope<M>
+where
+    M: Message,
+{
+    pub fn new(msg: Option<M>, tx: Option<oneshot::Sender<M::Response>>) -> Box<Self> {
+        Box::new(Self { msg, tx })
+    }
+}
+
+#[async_trait]
+impl<A, M> MsgToProcess<A> for Envelope<M>
 where
     A: Actor + Handler<M>,
     M: Message,
 {
-    fn process(&mut self, act: &mut A) {
+    async fn process(&mut self, act: &mut A) {
         if let Some(msg) = self.msg.take() {
-            let res = act.handle(msg);
+            let res = act.handle(msg).await;
             if let Some(tx) = self.tx.take() {
                 let _ = tx.send(res);
             }
@@ -54,51 +74,50 @@ where
     }
 }
 
-struct Addr<A>
+#[derive(Clone)]
+pub struct Addr<A>
 where
     A: Actor,
 {
-    tx: mpsc::Sender<Box<dyn Envelope<A>>>,
+    tx: mpsc::Sender<Box<dyn MsgToProcess<A>>>,
 }
 
-trait Sender<M>
+#[async_trait]
+pub trait Sender<M>
 where
     M: Message,
 {
-    async fn ask(&self, msg: M) -> Result<M::Response, RecvError>;
-    async fn tell(&self, msg: M);
+    async fn ask(&self, msg: M) -> Result<M::Response, ActorError>;
+    fn tell(&self, msg: M) -> Result<(), ActorError>;
 }
 
+#[async_trait]
 impl<M, A> Sender<M> for Addr<A>
 where
     M: Message,
     A: Actor + Handler<M>,
 {
-    async fn ask(&self, msg: M) -> Result<M::Response, RecvError> {
+    async fn ask(&self, msg: M) -> Result<M::Response, ActorError> {
         let (tx, rx) = oneshot::channel();
-        let _ = self
-            .tx
-            .send(Box::new(WrappedMessage {
-                msg: Some(msg),
-                tx: Some(tx),
-            }))
-            .await;
-        rx.await
+        self.tx
+            .send(Envelope::new(Some(msg), Some(tx)))
+            .await
+            .map_err(|_| ActorError::SendError)?;
+        rx.await.map_err(|_| ActorError::ResponseError)
     }
 
-    async fn tell(&self, msg: M) {
-        let tx = self.tx.clone();
-        let _ = tx
-            .send(Box::new(WrappedMessage {
-                msg: Some(msg),
-                tx: None,
-            }))
-            .await;
+    fn tell(&self, msg: M) -> Result<(), ActorError> {
+        self.tx
+            .try_send(Envelope::new(Some(msg), None))
+            .map_err(|_| ActorError::SendError)?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use crate::{Actor, Handler, Message, Sender};
 
     struct Counter {
@@ -121,29 +140,34 @@ mod tests {
         type Response = u64;
     }
 
+    #[async_trait]
     impl Handler<Increment> for Counter {
-        fn handle(&mut self, _msg: Increment) {
+        async fn handle(&mut self, _msg: Increment) {
             self.count += 1;
         }
     }
 
+    #[async_trait]
     impl Handler<Decrement> for Counter {
-        fn handle(&mut self, _msg: Decrement) {
+        async fn handle(&mut self, _msg: Decrement) {
             self.count -= 1;
         }
     }
+
+    #[async_trait]
     impl Handler<GetCount> for Counter {
-        fn handle(&mut self, _msg: GetCount) -> u64 {
+        async fn handle(&mut self, _msg: GetCount) -> u64 {
             self.count
         }
     }
+
     #[tokio::test]
     async fn it_works() -> anyhow::Result<()> {
         let counter = Counter { count: 0 }.start();
 
-        counter.tell(Increment).await;
-        counter.tell(Increment).await;
-        counter.tell(Decrement).await;
+        counter.tell(Increment)?;
+        counter.tell(Increment)?;
+        counter.tell(Decrement)?;
         let count = counter.ask(GetCount).await?;
 
         assert_eq!(count, 1);

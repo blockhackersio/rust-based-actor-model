@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
 anyhow = { version = "1.0.100" }
+thiserror = "2.0.17"
+async-trait = "0.1.89"
