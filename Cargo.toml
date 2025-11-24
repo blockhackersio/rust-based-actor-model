@@ -13,4 +13,5 @@ anyhow = { version = "1.0.100" }
 thiserror = "2.0.17"
 async-trait = "0.1.89"
 macros = { path = "./macros" }
+actix = "0.13.5"
 
