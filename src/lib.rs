@@ -10,9 +10,11 @@ pub enum ActorError {
     SendError,
 }
 
+type PointerToMsgToProcess<A> = Box<dyn MsgToProcess<A>>;
+
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::channel::<Box<dyn MsgToProcess<Self>>>(100);
+        let (tx, mut rx) = mpsc::channel::<PointerToMsgToProcess<Self>>(100);
         tokio::spawn(async move {
             let mut this = self;
             while let Some(mut msg) = rx.recv().await {
@@ -117,46 +119,45 @@ where
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use macros::Message;
 
     use crate::{Actor, Handler, Message, Sender};
 
     struct Counter {
         count: u64,
     }
+
     impl Actor for Counter {}
 
-    struct Increment;
-    impl Message for Increment {
-        type Response = ();
+    #[derive(Message)]
+    struct Increment {
+        amount: u64,
     }
 
+    #[derive(Message)]
     struct Decrement;
-    impl Message for Decrement {
-        type Response = ();
-    }
 
+    #[derive(Message)]
+    #[response(u64)]
     struct GetCount;
-    impl Message for GetCount {
-        type Response = u64;
-    }
 
     #[async_trait]
     impl Handler<Increment> for Counter {
-        async fn handle(&mut self, _msg: Increment) {
-            self.count += 1;
+        async fn handle(&mut self, msg: Increment) {
+            self.count += msg.amount;
         }
     }
 
     #[async_trait]
     impl Handler<Decrement> for Counter {
-        async fn handle(&mut self, _msg: Decrement) {
+        async fn handle(&mut self, _: Decrement) {
             self.count -= 1;
         }
     }
 
     #[async_trait]
     impl Handler<GetCount> for Counter {
-        async fn handle(&mut self, _msg: GetCount) -> u64 {
+        async fn handle(&mut self, _: GetCount) -> u64 {
             self.count
         }
     }
@@ -165,8 +166,8 @@ mod tests {
     async fn it_works() -> anyhow::Result<()> {
         let counter = Counter { count: 0 }.start();
 
-        counter.tell(Increment)?;
-        counter.tell(Increment)?;
+        counter.tell(Increment { amount: 1 })?;
+        counter.tell(Increment { amount: 1 })?;
         counter.tell(Decrement)?;
         let count = counter.ask(GetCount).await?;
 
