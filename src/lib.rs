@@ -1,4 +1,7 @@
-use tokio::sync::mpsc;
+use tokio::sync::{
+    mpsc,
+    oneshot::{self, error::RecvError},
+};
 
 trait Actor: Send + Sized + 'static {
     fn start(mut self) -> Addr<Self> {
@@ -12,14 +15,16 @@ trait Actor: Send + Sized + 'static {
     }
 }
 
-trait Message: Send + 'static {}
+trait Message: Send + 'static {
+    type Response: Send;
+}
 
 trait Handler<M>
 where
     Self: Actor,
     M: Message,
 {
-    fn handle(&mut self, msg: M);
+    fn handle(&mut self, msg: M) -> M::Response;
 }
 
 trait Envelope<A>: Send {
@@ -31,6 +36,7 @@ where
     M: Message,
 {
     pub msg: Option<M>,
+    pub tx: Option<oneshot::Sender<M::Response>>,
 }
 
 impl<A, M> Envelope<A> for WrappedMessage<M>
@@ -40,7 +46,10 @@ where
 {
     fn process(&mut self, act: &mut A) {
         if let Some(msg) = self.msg.take() {
-            act.handle(msg);
+            let res = act.handle(msg);
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(res);
+            }
         }
     }
 }
@@ -52,8 +61,12 @@ where
     tx: mpsc::Sender<Box<dyn Envelope<A>>>,
 }
 
-trait Sender<M> {
-    async fn send(&self, msg: M);
+trait Sender<M>
+where
+    M: Message,
+{
+    async fn ask(&self, msg: M) -> Result<M::Response, RecvError>;
+    async fn tell(&self, msg: M);
 }
 
 impl<M, A> Sender<M> for Addr<A>
@@ -61,10 +74,25 @@ where
     M: Message,
     A: Actor + Handler<M>,
 {
-    async fn send(&self, msg: M) {
+    async fn ask(&self, msg: M) -> Result<M::Response, RecvError> {
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .tx
-            .send(Box::new(WrappedMessage { msg: Some(msg) }))
+            .send(Box::new(WrappedMessage {
+                msg: Some(msg),
+                tx: Some(tx),
+            }))
+            .await;
+        rx.await
+    }
+
+    async fn tell(&self, msg: M) {
+        let tx = self.tx.clone();
+        let _ = tx
+            .send(Box::new(WrappedMessage {
+                msg: Some(msg),
+                tx: None,
+            }))
             .await;
     }
 }
@@ -79,29 +107,47 @@ mod tests {
     impl Actor for Counter {}
 
     struct Increment;
-    impl Message for Increment {}
+    impl Message for Increment {
+        type Response = ();
+    }
 
     struct Decrement;
-    impl Message for Decrement {}
+    impl Message for Decrement {
+        type Response = ();
+    }
+
+    struct GetCount;
+    impl Message for GetCount {
+        type Response = u64;
+    }
 
     impl Handler<Increment> for Counter {
         fn handle(&mut self, _msg: Increment) {
             self.count += 1;
         }
     }
+
     impl Handler<Decrement> for Counter {
         fn handle(&mut self, _msg: Decrement) {
-            self.count += 1;
+            self.count -= 1;
         }
     }
-
+    impl Handler<GetCount> for Counter {
+        fn handle(&mut self, _msg: GetCount) -> u64 {
+            self.count
+        }
+    }
     #[tokio::test]
-    async fn it_works() {
+    async fn it_works() -> anyhow::Result<()> {
         let counter = Counter { count: 0 }.start();
 
-        counter.send(Increment).await;
-        counter.send(Increment).await;
-        counter.send(Decrement).await;
+        counter.tell(Increment).await;
+        counter.tell(Increment).await;
+        counter.tell(Decrement).await;
+        let count = counter.ask(GetCount).await?;
+
+        assert_eq!(count, 1);
+        Ok(())
     }
 }
 
