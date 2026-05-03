@@ -9,6 +9,7 @@ Otherwise, install Rust via [rustup](https://rustup.rs).
 ## Usage
 
 ```rust
+use macros::Message;
 use crate::{Actor, Handler, Message, Sender};
 
 struct Counter {
@@ -48,11 +49,34 @@ impl Handler<GetCount> for Counter {
     }
 }
 
+let counter = Counter { count: 0 }.start();
+
+counter.tell(Increment);
+counter.tell(Increment);
+counter.tell(Decrement);
+
+let count = counter.ask(GetCount).await;
+
+assert_eq!(count, 2);
 ```
 
 
 ## Running the tests
 ```bash
-cargo test
+$ cargo test -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/actor_simple-d3ce364961d411e4)
+
+running 1 test
+2.7 million msg/sec
+test tests::it_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s
+
+   Doc-tests actor_simple
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
