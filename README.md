@@ -54,6 +54,7 @@ let counter = Counter { count: 0 }.start();
 counter.tell(Increment);
 counter.tell(Increment);
 counter.tell(Decrement);
+counter.tell(Increment);
 
 let count = counter.ask(GetCount).await;
 
