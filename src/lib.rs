@@ -130,47 +130,47 @@ mod tests {
     use async_trait::async_trait;
     use macros::Message;
 
-    use crate::{Actor, Handler, Message, Sender};
-
-    struct Counter {
-        count: i64,
-    }
-
-    impl Actor for Counter {}
-
-    #[derive(Message)]
-    struct Increment;
-
-    #[derive(Message)]
-    struct Decrement;
-
-    #[derive(Message)]
-    #[response(i64)]
-    struct GetCount;
-
-    #[async_trait]
-    impl Handler<Increment> for Counter {
-        async fn handle(&mut self, _: Increment) {
-            self.count += 1;
-        }
-    }
-
-    #[async_trait]
-    impl Handler<Decrement> for Counter {
-        async fn handle(&mut self, _: Decrement) {
-            self.count -= 1;
-        }
-    }
-
-    #[async_trait]
-    impl Handler<GetCount> for Counter {
-        async fn handle(&mut self, _: GetCount) -> i64 {
-            self.count
-        }
-    }
+    use crate::{Actor, Addr, Handler, Message, Sender};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn it_works() -> anyhow::Result<()> {
+        struct Counter {
+            count: i64,
+        }
+
+        impl Actor for Counter {}
+
+        #[derive(Message)]
+        struct Increment;
+
+        #[derive(Message)]
+        struct Decrement;
+
+        #[derive(Message)]
+        #[response(i64)]
+        struct GetCount;
+
+        #[async_trait]
+        impl Handler<Increment> for Counter {
+            async fn handle(&mut self, _: Increment) {
+                self.count += 1;
+            }
+        }
+
+        #[async_trait]
+        impl Handler<Decrement> for Counter {
+            async fn handle(&mut self, _: Decrement) {
+                self.count -= 1;
+            }
+        }
+
+        #[async_trait]
+        impl Handler<GetCount> for Counter {
+            async fn handle(&mut self, _: GetCount) -> i64 {
+                self.count
+            }
+        }
+
         let counter = Counter { count: 0 }.start();
 
         let mut handles = vec![];
@@ -200,6 +200,101 @@ mod tests {
         let finished = start.elapsed();
         let msg_per_sec = total as f64 / finished.as_secs_f64();
         println!("{:.1} million msg/sec", msg_per_sec / 1_000_000.0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervision() -> anyhow::Result<()> {
+        struct Db {
+            value: i64,
+        }
+
+        impl Actor for Db {}
+
+        #[derive(Message)]
+        #[response(i64)]
+        struct DbGet;
+
+        #[derive(Message)]
+        struct DbSet(i64);
+
+        #[async_trait]
+        impl Handler<DbGet> for Db {
+            async fn handle(&mut self, _: DbGet) -> i64 {
+                self.value
+            }
+        }
+
+        #[async_trait]
+        impl Handler<DbSet> for Db {
+            async fn handle(&mut self, msg: DbSet) {
+                self.value = msg.0;
+            }
+        }
+
+        struct Counter {
+            db: Addr<Db>,
+        }
+
+        impl Actor for Counter {}
+
+        #[derive(Message)]
+        #[response(i64)]
+        struct Increment;
+
+        #[derive(Message)]
+        #[response(i64)]
+        struct GetCount;
+
+        #[derive(Message)]
+        struct Poison;
+
+        #[async_trait]
+        impl Handler<Increment> for Counter {
+            async fn handle(&mut self, _: Increment) -> i64 {
+                let count = self.db.ask(DbGet).await + 1;
+                self.db.tell(DbSet(count));
+                count
+            }
+        }
+
+        #[async_trait]
+        impl Handler<GetCount> for Counter {
+            async fn handle(&mut self, _: GetCount) -> i64 {
+                self.db.ask(DbGet).await
+            }
+        }
+
+        #[async_trait]
+        impl Handler<Poison> for Counter {
+            async fn handle(&mut self, _: Poison) {
+                panic!("poisoned!");
+            }
+        }
+
+        let db = Db { value: 0 }.start();
+        let counter = Counter { db: db.clone() }.start();
+
+        for _ in 0..5 {
+            counter.ask(Increment).await;
+        }
+        assert_eq!(counter.ask(GetCount).await, 5);
+        assert_eq!(db.ask(DbGet).await, 5);
+
+        // Poison the counter
+        counter.tell(Poison);
+
+        // Counter is stateless — all state lives in DB.
+        // Supervision just needs to keep the loop alive.
+        let count = counter.ask(GetCount).await;
+        assert_eq!(count, 5, "state survives because it lives in the db actor");
+
+        for _ in 0..3 {
+            counter.ask(Increment).await;
+        }
+        assert_eq!(counter.ask(GetCount).await, 8);
+        assert_eq!(db.ask(DbGet).await, 8);
+
         Ok(())
     }
 }
