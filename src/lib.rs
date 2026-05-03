@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::{
-    mpsc::{self, error::TrySendError},
+    mpsc::{self},
     oneshot,
 };
 
@@ -13,11 +13,11 @@ pub enum ActorError {
     SendError,
 }
 
-type PointerToMsgToProcess<A> = Box<dyn MsgToProcess<A>>;
+type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::channel::<PointerToMsgToProcess<Self>>(1000000000);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<Self>>();
         tokio::spawn(async move {
             let mut this = self;
             while let Some(mut msg) = rx.recv().await {
@@ -42,7 +42,7 @@ where
 }
 
 #[async_trait]
-pub trait MsgToProcess<A>: Send {
+pub trait ActorMessage<A>: Send {
     async fn process(&mut self, act: &mut A);
 }
 
@@ -64,7 +64,7 @@ where
 }
 
 #[async_trait]
-impl<A, M> MsgToProcess<A> for Envelope<M>
+impl<A, M> ActorMessage<A> for Envelope<M>
 where
     A: Actor + Handler<M>,
     M: Message,
@@ -83,7 +83,7 @@ pub struct Addr<A>
 where
     A: Actor,
 {
-    tx: mpsc::Sender<Box<dyn MsgToProcess<A>>>,
+    tx: mpsc::UnboundedSender<PointerToActorMessage<A>>,
 }
 
 impl<A> Clone for Addr<A>
@@ -102,8 +102,8 @@ pub trait Sender<M>
 where
     M: Message,
 {
-    async fn ask(&self, msg: M) -> Result<M::Response, ActorError>;
-    async fn tell(&self, msg: M) -> Result<(), ActorError>;
+    async fn ask(&self, msg: M) -> M::Response;
+    fn tell(&self, msg: M);
 }
 
 #[async_trait]
@@ -112,27 +112,14 @@ where
     M: Message,
     A: Actor + Handler<M>,
 {
-    async fn ask(&self, msg: M) -> Result<M::Response, ActorError> {
+    async fn ask(&self, msg: M) -> M::Response {
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Envelope::new(Some(msg), Some(tx)))
-            .await
-            .map_err(|_| ActorError::SendError)?;
-        rx.await.map_err(|_| ActorError::ResponseError)
+        let _ = self.tx.send(Envelope::new(Some(msg), Some(tx)));
+        rx.await.expect("actor dropped before responding")
     }
 
-    async fn tell(&self, msg: M) -> Result<(), ActorError> {
-        match self.tx.try_send(Envelope::new(Some(msg), None)) {
-            Ok(_) => Ok(()),
-            Err(TrySendError::Full(envelope)) => {
-                self.tx
-                    .send(envelope)
-                    .await
-                    .map_err(|_| ActorError::SendError)?;
-                Ok(())
-            }
-            Err(_) => Err(ActorError::SendError),
-        }
+    fn tell(&self, msg: M) {
+        let _ = self.tx.send(Envelope::new(Some(msg), None));
     }
 }
 
@@ -195,20 +182,20 @@ mod tests {
         let start = Instant::now();
         handles.push(tokio::task::spawn(async move {
             for _ in 0..(total / 2) {
-                t1.tell(Increment).await?;
+                t1.tell(Increment);
             }
             Ok::<_, anyhow::Error>(())
         }));
         handles.push(tokio::task::spawn(async move {
             for _ in 0..(total / 2) {
-                t2.tell(Decrement).await?;
+                t2.tell(Decrement);
             }
             Ok::<_, anyhow::Error>(())
         }));
         for handle in handles {
             handle.await??;
         }
-        let count = counter.ask(GetCount).await?;
+        let count = counter.ask(GetCount).await;
         assert_eq!(count, 0);
         let finished = start.elapsed();
         let msg_per_sec = total as f64 / finished.as_secs_f64();
@@ -216,4 +203,3 @@ mod tests {
         Ok(())
     }
 }
-
