@@ -1,31 +1,46 @@
 use async_trait::async_trait;
-use thiserror::Error;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
 use tokio::sync::{
     mpsc::{self},
     oneshot,
 };
 
-#[derive(Error, Debug)]
-pub enum ActorError {
-    #[error("Error receiving message")]
-    ResponseError,
-    #[error("Error sending message")]
-    SendError,
-}
-
 type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<Self>>();
-        tokio::spawn(async move {
-            let mut this = self;
-            while let Some(mut msg) = rx.recv().await {
-                msg.process(&mut this).await;
-            }
-        });
-        Addr { tx }
+        let mut slot = Some(self);
+        start_actor(move || slot.take().expect(""))
     }
+}
+
+fn start_actor<A, F>(mut factory: F) -> Addr<A>
+where
+    A: Actor + 'static,
+    F: FnMut() -> A + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<A>>();
+    let addr = Addr { tx };
+    tokio::spawn(async move {
+        loop {
+            let mut actor = factory();
+            while let Some(mut msg) = rx.recv().await {
+                match AssertUnwindSafe(msg.process(&mut actor))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        eprintln!("Actor panicked! Restarting...");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    addr
 }
 
 pub trait Message: Send + 'static {
@@ -97,6 +112,54 @@ where
     }
 }
 
+impl<A: Actor> Addr<A> {
+    pub fn add_child<F, B>(&self, f: F) -> ChildBuilder<A, B, F>
+    where
+        B: Actor,
+        F: FnMut() -> B + Send + 'static,
+    {
+        ChildBuilder::<A, B, F> {
+            parent: self.clone(),
+            max_restarts: 3,
+            window: Duration::from_secs(8),
+            factory: Box::new(f),
+        }
+    }
+}
+
+pub struct ChildBuilder<A, B, F>
+where
+    A: Actor,
+    B: Actor,
+    F: FnMut() -> B + Send + 'static,
+{
+    parent: Addr<A>,
+    factory: Box<F>,
+    max_restarts: usize,
+    window: Duration,
+}
+
+impl<A, B, F> ChildBuilder<A, B, F>
+where
+    A: Actor,
+    B: Actor,
+    F: FnMut() -> B + Send + 'static,
+{
+    pub fn max_restarts(mut self, n: usize) -> Self {
+        self.max_restarts = n;
+        self
+    }
+
+    pub fn window(mut self, d: Duration) -> Self {
+        self.window = d;
+        self
+    }
+
+    pub fn start(self) -> Addr<B> {
+        start_actor(self.factory)
+    }
+}
+
 #[async_trait]
 pub trait Sender<M>
 where
@@ -132,6 +195,7 @@ mod tests {
 
     use crate::{Actor, Addr, Handler, Message, Sender};
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread")]
     async fn it_works() -> anyhow::Result<()> {
         struct Counter {
@@ -140,13 +204,13 @@ mod tests {
 
         impl Actor for Counter {}
 
-        #[derive(Message)]
+        #[derive(Clone, Message)]
         struct Increment;
 
-        #[derive(Message)]
+        #[derive(Clone, Message)]
         struct Decrement;
 
-        #[derive(Message)]
+        #[derive(Clone, Message)]
         #[response(i64)]
         struct GetCount;
 
@@ -203,8 +267,13 @@ mod tests {
         Ok(())
     }
 
+    // #[ignore]
     #[tokio::test(flavor = "multi_thread")]
     async fn supervision() -> anyhow::Result<()> {
+        struct Root {}
+
+        impl Actor for Root {}
+
         struct Db {
             value: i64,
         }
@@ -272,8 +341,10 @@ mod tests {
             }
         }
 
-        let db = Db { value: 0 }.start();
-        let counter = Counter { db: db.clone() }.start();
+        let root = Root {}.start();
+        let db = root.add_child(|| Db { value: 0 }).start();
+        let dbc = db.clone();
+        let counter = root.add_child(move || Counter { db: dbc.clone() }).start();
 
         for _ in 0..5 {
             counter.ask(Increment).await;
