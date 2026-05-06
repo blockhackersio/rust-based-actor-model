@@ -1,30 +1,34 @@
 use async_trait::async_trait;
-use thiserror::Error;
 use tokio::sync::{
     mpsc::{self},
     oneshot,
 };
-
-#[derive(Error, Debug)]
-pub enum ActorError {
-    #[error("Error receiving message")]
-    ResponseError,
-    #[error("Error sending message")]
-    SendError,
-}
 
 type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<Self>>();
+        let addr = Addr { tx };
+        let addr_clone = addr.clone();
         tokio::spawn(async move {
             let mut this = self;
+            let ctx = Ctx::<Self> { addr: addr_clone };
             while let Some(mut msg) = rx.recv().await {
-                msg.process(&mut this).await;
+                msg.process(&mut this, &ctx).await;
             }
         });
-        Addr { tx }
+        addr
+    }
+}
+
+pub struct Ctx<A: Actor> {
+    addr: Addr<A>,
+}
+
+impl<A: Actor> Ctx<A> {
+    pub fn address(&self) -> Addr<A> {
+        self.addr.clone()
     }
 }
 
@@ -38,12 +42,12 @@ where
     Self: Actor,
     M: Message,
 {
-    async fn handle(&mut self, msg: M) -> M::Response;
+    async fn handle(&mut self, msg: M, ctx: &Ctx<Self>) -> M::Response;
 }
 
 #[async_trait]
-pub trait ActorMessage<A>: Send {
-    async fn process(&mut self, act: &mut A);
+pub trait ActorMessage<A: Actor>: Send {
+    async fn process(&mut self, act: &mut A, ctx: &Ctx<A>);
 }
 
 pub struct Envelope<M>
@@ -69,9 +73,9 @@ where
     A: Actor + Handler<M>,
     M: Message,
 {
-    async fn process(&mut self, act: &mut A) {
+    async fn process(&mut self, act: &mut A, ctx: &Ctx<A>) {
         if let Some(msg) = self.msg.take() {
-            let res = act.handle(msg).await;
+            let res = act.handle(msg, ctx).await;
             if let Some(tx) = self.tx.take() {
                 let _ = tx.send(res);
             }
@@ -130,7 +134,7 @@ mod tests {
     use async_trait::async_trait;
     use macros::Message;
 
-    use crate::{Actor, Handler, Message, Sender};
+    use crate::{Actor, Ctx, Handler, Message, Sender};
 
     struct Counter {
         count: i64,
@@ -150,21 +154,21 @@ mod tests {
 
     #[async_trait]
     impl Handler<Increment> for Counter {
-        async fn handle(&mut self, _: Increment) {
+        async fn handle(&mut self, _: Increment, _: &Ctx<Self>) {
             self.count += 1;
         }
     }
 
     #[async_trait]
     impl Handler<Decrement> for Counter {
-        async fn handle(&mut self, _: Decrement) {
+        async fn handle(&mut self, _: Decrement, _: &Ctx<Self>) {
             self.count -= 1;
         }
     }
 
     #[async_trait]
     impl Handler<GetCount> for Counter {
-        async fn handle(&mut self, _: GetCount) -> i64 {
+        async fn handle(&mut self, _: GetCount, _: &Ctx<Self>) -> i64 {
             self.count
         }
     }
