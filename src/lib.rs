@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::{
     mpsc::{self},
     oneshot,
@@ -9,16 +11,15 @@ type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
         let mut slot = Some(self);
-        start_actor(move || slot.take().unwrap())
+        start_actor(move || slot.take().expect("Slot already used!"))
     }
 
-    fn spawn<A, F>(&mut self, mut factory: F) -> Addr<A>
+    fn spawn<A, F>(&mut self, factory: F) -> Addr<A>
     where
         A: Actor,
         F: FnMut() -> A + Send + 'static,
     {
-        let actor = factory();
-        actor.start()
+        start_actor(factory)
     }
 }
 
@@ -28,14 +29,26 @@ where
     F: FnMut() -> A + Send + 'static,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<A>>();
+    let addr = Addr { tx };
     tokio::spawn(async move {
-        let mut actor = factory();
+        loop {
+            let mut actor = factory();
 
-        while let Some(mut msg) = rx.recv().await {
-            msg.process(&mut actor).await;
+            while let Some(mut msg) = rx.recv().await {
+                match AssertUnwindSafe(msg.process(&mut actor))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        eprintln!("Actor panicked!\nRestarting...");
+                        break;
+                    }
+                }
+            }
         }
     });
-    Addr { tx }
+    addr
 }
 
 pub trait Message: Send + 'static {
@@ -138,7 +151,8 @@ mod tests {
     use crate::{Actor, Addr, Handler, Message, Sender};
     use async_trait::async_trait;
     use macros::Message;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+    use tokio::time::sleep;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn simple_counter() -> anyhow::Result<()> {
@@ -209,10 +223,11 @@ mod tests {
         let finished = start.elapsed();
         let msg_per_sec = total as f64 / finished.as_secs_f64();
         println!("{:.1} million msg/sec", msg_per_sec / 1_000_000.0);
+        sleep(Duration::from_secs(1)).await;
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn restart_counter() -> anyhow::Result<()> {
         struct Db {
             value: i64,
@@ -302,15 +317,16 @@ mod tests {
 
         let counter = root.ask(GetCounter).await;
         for _ in 0..5 {
-            counter.ask(Increment).await;
+            counter.tell(Increment);
         }
         assert_eq!(counter.ask(GetCount).await, 5);
 
         // THE FOLLOWING WILL CRASH!
-        // counter.tell(Poison);
+        counter.tell(Poison);
+        counter.ask(Increment).await;
 
         let count = counter.ask(GetCount).await;
-        assert_eq!(count, 5, "state survives because it lives in the db actor");
+        assert_eq!(count, 6, "state survives because it lives in the db actor");
 
         Ok(())
     }
