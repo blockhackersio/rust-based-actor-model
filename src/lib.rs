@@ -138,52 +138,51 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
+    use crate::{Actor, Ctx, Handler, Message, Sender};
     use async_trait::async_trait;
     use macros::Message;
-
-    use crate::{Actor, Ctx, Handler, Message, Sender};
-
-    struct Counter {
-        count: i64,
-    }
-
-    impl Actor for Counter {}
-
-    #[derive(Message)]
-    struct Increment;
-
-    #[derive(Message)]
-    struct Decrement;
-
-    #[derive(Message)]
-    #[response(i64)]
-    struct GetCount;
-
-    #[async_trait]
-    impl Handler<Increment> for Counter {
-        async fn handle(&mut self, _: Increment, _: &Ctx<Self>) {
-            self.count += 1;
-        }
-    }
-
-    #[async_trait]
-    impl Handler<Decrement> for Counter {
-        async fn handle(&mut self, _: Decrement, _: &Ctx<Self>) {
-            self.count -= 1;
-        }
-    }
-
-    #[async_trait]
-    impl Handler<GetCount> for Counter {
-        async fn handle(&mut self, _: GetCount, _: &Ctx<Self>) -> i64 {
-            self.count
-        }
-    }
+    use std::time::Instant;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn it_works() -> anyhow::Result<()> {
+    async fn simple_counter() -> anyhow::Result<()> {
+        // Simple counter
+        struct Counter {
+            count: i64,
+        }
+
+        impl Actor for Counter {}
+
+        #[derive(Message)]
+        struct Increment;
+
+        #[derive(Message)]
+        struct Decrement;
+
+        #[derive(Message)]
+        #[response(i64)]
+        struct GetCount;
+
+        #[async_trait]
+        impl Handler<Increment> for Counter {
+            async fn handle(&mut self, _: Increment, _: &Ctx<Self>) {
+                self.count += 1;
+            }
+        }
+
+        #[async_trait]
+        impl Handler<Decrement> for Counter {
+            async fn handle(&mut self, _: Decrement, _: &Ctx<Self>) {
+                self.count -= 1;
+            }
+        }
+
+        #[async_trait]
+        impl Handler<GetCount> for Counter {
+            async fn handle(&mut self, _: GetCount, _: &Ctx<Self>) -> i64 {
+                self.count
+            }
+        }
+
         let counter = Counter { count: 0 }.start();
 
         let mut handles = vec![];
