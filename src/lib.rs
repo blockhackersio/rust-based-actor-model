@@ -8,10 +8,32 @@ use tokio::sync::{
 
 type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
+struct ActorConfig {
+    restart: bool,
+}
+
+impl ActorConfig {
+    pub fn no_restart() -> ActorConfig {
+        ActorConfig { restart: false }
+    }
+}
+
+impl Default for ActorConfig {
+    fn default() -> Self {
+        Self { restart: true }
+    }
+}
+
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
         let mut slot = Some(self);
-        start_actor(move || slot.take().expect("Slot already used!"))
+        start_actor(
+            move || {
+                slot.take()
+                    .expect("factory function cannot be called twice!")
+            },
+            ActorConfig::no_restart(),
+        )
     }
 
     fn spawn<A, F>(&mut self, factory: F) -> Addr<A>
@@ -19,11 +41,11 @@ pub trait Actor: Send + Sized + 'static {
         A: Actor,
         F: FnMut() -> A + Send + 'static,
     {
-        start_actor(factory)
+        start_actor(factory, ActorConfig::default())
     }
 }
 
-fn start_actor<A, F>(mut factory: F) -> Addr<A>
+fn start_actor<A, F>(mut factory: F, config: ActorConfig) -> Addr<A>
 where
     A: Actor,
     F: FnMut() -> A + Send + 'static,
@@ -42,9 +64,13 @@ where
                     Ok(()) => {}
                     Err(_) => {
                         eprintln!("Actor panicked!\nRestarting...");
+
                         break;
                     }
                 }
+            }
+            if !config.restart {
+                break;
             }
         }
     });
@@ -321,7 +347,6 @@ mod tests {
         }
         assert_eq!(counter.ask(GetCount).await, 5);
 
-        // THE FOLLOWING WILL CRASH!
         counter.tell(Poison);
         counter.ask(Increment).await;
 
