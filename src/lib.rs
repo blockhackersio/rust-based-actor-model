@@ -8,18 +8,27 @@ type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<Self>>();
-        let addr = Addr { tx };
-        let addr_clone = addr.clone();
-        tokio::spawn(async move {
-            let mut this = self;
-            let ctx = Ctx::<Self> { addr: addr_clone };
-            while let Some(mut msg) = rx.recv().await {
-                msg.process(&mut this, &ctx).await;
-            }
-        });
-        addr
+        let mut once = Some(self);
+        start_actor(move || once.take().expect("Factory can only be accessed once!"))
     }
+}
+
+fn start_actor<A, F>(mut factory: F) -> Addr<A>
+where
+    A: Actor,
+    F: FnMut() -> A + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<A>>();
+    let addr = Addr { tx };
+    let addr_ctx = addr.clone();
+    tokio::spawn(async move {
+        let mut this = factory();
+        let ctx = Ctx::<A> { addr: addr_ctx };
+        while let Some(mut msg) = rx.recv().await {
+            msg.process(&mut this, &ctx).await;
+        }
+    });
+    addr
 }
 
 pub struct Ctx<A: Actor> {
