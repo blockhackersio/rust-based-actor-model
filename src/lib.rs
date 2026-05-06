@@ -1,17 +1,8 @@
 use async_trait::async_trait;
-use thiserror::Error;
 use tokio::sync::{
     mpsc::{self},
     oneshot,
 };
-
-#[derive(Error, Debug)]
-pub enum ActorError {
-    #[error("Error receiving message")]
-    ResponseError,
-    #[error("Error sending message")]
-    SendError,
-}
 
 type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
