@@ -20,6 +20,15 @@ pub trait Actor: Send + Sized + 'static {
         let mut slot = Some(self);
         start_actor(move || slot.take().unwrap())
     }
+
+    fn spawn<A, F>(&mut self, mut factory: F) -> Addr<A>
+    where
+        A: Actor,
+        F: FnMut() -> A + Send + 'static,
+    {
+        let actor = factory();
+        actor.start()
+    }
 }
 
 fn start_actor<A, F>(mut factory: F) -> Addr<A>
@@ -292,9 +301,8 @@ mod tests {
         #[async_trait]
         impl Handler<GetCounter> for Root {
             async fn handle(&mut self, _: GetCounter) -> Addr<Counter> {
-                // TODO: implement supervision and restarts
-                let db = Db { value: 0 }.start();
-                let counter = Counter { db: db.clone() }.start();
+                let db = self.spawn(|| Db { value: 0 });
+                let counter = self.spawn(move || Counter { db: db.clone() });
                 counter
             }
         }
