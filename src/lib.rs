@@ -8,19 +8,38 @@ use tokio::sync::{
 
 type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
-struct ActorConfig {
-    restart: bool,
+struct RestartManager<A>
+where
+    A: Actor,
+{
+    should_restart: bool,
+    supervisor: Option<Addr<A>>,
 }
 
-impl ActorConfig {
-    pub fn no_restart() -> ActorConfig {
-        ActorConfig { restart: false }
+impl<A: Actor> RestartManager<A> {
+    pub fn new(supervisor: Addr<A>) -> RestartManager<A> {
+        RestartManager::<A> {
+            supervisor: Some(supervisor),
+            should_restart: true,
+        }
     }
-}
 
-impl Default for ActorConfig {
-    fn default() -> Self {
-        Self { restart: true }
+    pub fn no_restart() -> RestartManager<A> {
+        RestartManager::<A> {
+            should_restart: false,
+            supervisor: None,
+        }
+    }
+
+    pub fn should_restart(&mut self) -> bool {
+        // Bail if should not restart
+        if !self.should_restart {
+            return false;
+        };
+
+        // count how many restarts within time period
+        // if too many then return false and escalate to parent
+        true
     }
 }
 
@@ -28,33 +47,34 @@ pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
         let mut slot = Some(self);
         start_actor(
-            move || {
+            move |_| {
                 slot.take()
                     .expect("factory function cannot be called twice!")
             },
-            ActorConfig::no_restart(),
+            RestartManager::no_restart(),
         )
     }
 
     fn spawn<A, F>(&mut self, factory: F) -> Addr<A>
     where
         A: Actor,
-        F: FnMut() -> A + Send + 'static,
+        F: FnMut(Addr<A>) -> A + Send + 'static,
     {
-        start_actor(factory, ActorConfig::default())
+        start_actor(factory, RestartManager::new())
     }
 }
 
-fn start_actor<A, F>(mut factory: F, config: ActorConfig) -> Addr<A>
+fn start_actor<A, F>(mut factory: F, mut config: RestartManager) -> Addr<A>
 where
     A: Actor,
-    F: FnMut() -> A + Send + 'static,
+    F: FnMut(Addr<A>) -> A + Send + 'static,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<A>>();
     let addr = Addr { tx };
+    let addr_clone = addr.clone();
     tokio::spawn(async move {
         loop {
-            let mut actor = factory();
+            let mut actor = factory(addr_clone);
 
             while let Some(mut msg) = rx.recv().await {
                 match AssertUnwindSafe(msg.process(&mut actor))
@@ -64,12 +84,11 @@ where
                     Ok(()) => {}
                     Err(_) => {
                         eprintln!("Actor panicked!\nRestarting...");
-
                         break;
                     }
                 }
             }
-            if !config.restart {
+            if !config.should_restart() {
                 break;
             }
         }
