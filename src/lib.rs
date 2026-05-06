@@ -17,15 +17,25 @@ type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
 pub trait Actor: Send + Sized + 'static {
     fn start(self) -> Addr<Self> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<Self>>();
-        tokio::spawn(async move {
-            let mut this = self;
-            while let Some(mut msg) = rx.recv().await {
-                msg.process(&mut this).await;
-            }
-        });
-        Addr { tx }
+        let mut slot = Some(self);
+        start_actor(move || slot.take().unwrap())
     }
+}
+
+fn start_actor<A, F>(mut factory: F) -> Addr<A>
+where
+    A: Actor,
+    F: FnMut() -> A + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<PointerToActorMessage<A>>();
+    tokio::spawn(async move {
+        let mut actor = factory();
+
+        while let Some(mut msg) = rx.recv().await {
+            msg.process(&mut actor).await;
+        }
+    });
+    Addr { tx }
 }
 
 pub trait Message: Send + 'static {
