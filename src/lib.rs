@@ -202,20 +202,13 @@ impl<A: Actor> Ctx<A> {
         self.children.lock().unwrap().push(Arc::new(child.clone()));
         child.address()
     }
-
-    async fn stop_all_children(&self) {
-        let children: Vec<_> = self.children.lock().unwrap().drain(..).collect();
-        for child in children {
-            child.stop();
-            child.wait_until_stopped().await;
-        }
-    }
 }
 
 #[async_trait]
 pub trait Stoppable {
     fn stop(&self);
     async fn wait_until_stopped(&self);
+    async fn stop_all_children(&self);
 }
 
 pub trait Message: Send + 'static {
@@ -331,6 +324,14 @@ where
 
     async fn wait_until_stopped(&self) {
         self.stopped.cancelled().await;
+    }
+
+    async fn stop_all_children(&self) {
+        let children: Vec<_> = self.children.lock().unwrap().drain(..).collect();
+        for child in children {
+            child.stop();
+            child.wait_until_stopped().await;
+        }
     }
 }
 
