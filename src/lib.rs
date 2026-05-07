@@ -27,6 +27,8 @@ pub trait Actor: Send + Sync + Sized + 'static {
     async fn started(&self, _ctx: &Ctx<Self>) {}
     /// Override to run an action after messages have been drained and stop processed
     async fn stopped(&self, _ctx: &Ctx<Self>) {}
+    /// Override to run an action after started when an actor has restarted but before the first message
+    async fn restarted(&self, _restarts: u64, _ctx: &Ctx<Self>) {}
     /// Override to change the interrupt behaviour. Default behaviour on escalation is to restart the parent actor
     async fn child_escalated(&self, _ctx: &Ctx<Self>) -> Option<Interrupt> {
         Some(Interrupt::RestartToEscalate)
@@ -77,6 +79,7 @@ where
     };
     let ctx_loop = ctx.clone();
     tokio::spawn(async move {
+        let mut is_restart = false;
         let ctx = ctx_loop;
         let _stopped_guard = stopped.drop_guard();
 
@@ -85,6 +88,9 @@ where
         loop {
             let mut actor = factory();
             actor.started(&ctx).await;
+            if is_restart {
+                actor.restarted(restarts, &ctx).await;
+            }
             let code = loop {
                 tokio::select! {
                     biased; // Important makes sure we check in order
@@ -130,6 +136,7 @@ where
                     break;
                 }
                 Interrupt::RestartToEscalate => {
+                    is_restart = true;
                     if first_restart.elapsed().as_secs() > restart_config.window {
                         restarts = 0;
                         first_restart = Instant::now();
