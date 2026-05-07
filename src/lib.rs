@@ -19,6 +19,7 @@ pub trait Actor: Send + Sync + Sized + 'static {
             move || once.take().expect("Factory can only be accessed once!"),
             CancellationToken::new(),
             mpsc::unbounded_channel().0,
+            RestartConfig::default(),
         );
         ctx.address()
     }
@@ -35,13 +36,27 @@ pub trait Actor: Send + Sync + Sized + 'static {
 pub enum Interrupt {
     Stop,
     RestartToEscalate,
-    Bail,
+}
+
+struct RestartConfig {
+    window: u64,
+    max_restarts: u64,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            window: 5,
+            max_restarts: 3,
+        }
+    }
 }
 
 fn start_actor<A, F>(
     mut factory: F,
     cancel: CancellationToken,
     escalate_to_parent: mpsc::UnboundedSender<()>,
+    restart_config: RestartConfig,
 ) -> Ctx<A>
 where
     A: Actor + Sync,
@@ -65,7 +80,7 @@ where
         let ctx = ctx_loop;
         let _stopped_guard = stopped.drop_guard();
 
-        let mut restarts = 0u32;
+        let mut restarts = 0u64;
         let mut first_restart = Instant::now();
         loop {
             let mut actor = factory();
@@ -89,13 +104,17 @@ where
                     // Receive a message
                     msg = rx.recv() => {
                         let Some(mut msg) = msg else {
-                            break Interrupt::Bail;
+                            break Interrupt::Stop;
                         };
-                        if let Err(_) = AssertUnwindSafe(msg.process(&mut actor, &ctx))
+                        if let Err(panic) = AssertUnwindSafe(msg.process(&mut actor, &ctx))
                             .catch_unwind()
                             .await
                         {
-                            eprintln!("Actor panicked! Restarting...");
+                            let msg = panic.downcast_ref::<&str>().copied()
+                                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                                .unwrap_or("<non-string panic>");
+
+                            eprintln!("ACTOR PANIC!\n actor:{}\n reason: {}\n restarting...", std::any::type_name::<A>(), msg);
                             break Interrupt::RestartToEscalate;
                         }
                     }
@@ -110,22 +129,16 @@ where
                     actor.stopped(&ctx).await;
                     break;
                 }
-                Interrupt::Bail => {
-                    // restarting wont help
-                    break;
-                }
                 Interrupt::RestartToEscalate => {
-                    let window = 5;
-                    let max_restarts = 3;
-                    if first_restart.elapsed().as_secs() > window {
+                    if first_restart.elapsed().as_secs() > restart_config.window {
                         restarts = 0;
                         first_restart = Instant::now();
                     }
                     restarts += 1;
-                    if restarts >= max_restarts {
+                    if restarts >= restart_config.max_restarts {
                         eprintln!(
                             "Actor restarted {} times in {}s, escalating.",
-                            max_restarts, window
+                            restart_config.max_restarts, restart_config.window
                         );
                         let _ = escalate_to_parent.send(());
                         break;
@@ -177,6 +190,7 @@ impl<A: Actor> Ctx<A> {
             factory,
             self.cancel.child_token(),
             self.child_escalations.clone(),
+            RestartConfig::default(),
         );
         self.children.lock().unwrap().push(Arc::new(child.clone()));
         child.address()
