@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::FutureExt;
+use std::sync::OnceLock;
 use std::{
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
@@ -8,6 +9,30 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+pub struct ActorSystem;
+
+#[async_trait]
+impl Actor for ActorSystem {}
+
+static ACTOR_SYSTEM: OnceLock<Ctx<ActorSystem>> = OnceLock::new();
+
+impl ActorSystem {
+    pub fn global() -> &'static Ctx<ActorSystem> {
+        ACTOR_SYSTEM.get_or_init(|| {
+            let mut once = Some(ActorSystem);
+            start_actor(
+                move || {
+                    once.take()
+                        .expect("ActorSystem factory called more than once")
+                },
+                CancellationToken::new(),
+                mpsc::unbounded_channel().0,
+                RestartConfig::default(),
+            )
+        })
+    }
+}
+
 type PointerToActorMessage<A> = Box<dyn ActorMessage<A>>;
 
 #[async_trait]
@@ -15,13 +40,8 @@ pub trait Actor: Send + Sync + Sized + 'static {
     /// Start the actor
     fn start(self) -> Addr<Self> {
         let mut once = Some(self);
-        let ctx = start_actor(
-            move || once.take().expect("Factory can only be accessed once!"),
-            CancellationToken::new(),
-            mpsc::unbounded_channel().0,
-            RestartConfig::default(),
-        );
-        ctx.address()
+        ActorSystem::global()
+            .spawn(move || once.take().expect("Factory can only be accessed once!"))
     }
     /// Override to run an action after started but before the first message
     async fn started(&self, _ctx: &Ctx<Self>) {}
@@ -343,7 +363,6 @@ mod tests {
     use std::time::Instant;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
     async fn simple_counter() -> anyhow::Result<()> {
         // Simple counter
         struct Counter {
