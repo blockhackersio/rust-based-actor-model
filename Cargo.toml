@@ -14,4 +14,6 @@ thiserror = "2.0.17"
 async-trait = "0.1.89"
 macros = { path = "./macros" }
 actix = "0.13.5"
+futures = "0.3.32"
+tokio-util = "0.7.18"
 
