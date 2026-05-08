@@ -40,8 +40,10 @@ pub trait Actor: Send + Sync + Sized + 'static {
     /// Start the actor
     fn start(self) -> Addr<Self> {
         let mut once = Some(self);
-        ActorSystem::global()
-            .spawn(move || once.take().expect("Factory can only be accessed once!"))
+        ActorSystem::global().spawn_with_config(
+            move || once.take().expect("Factory can only be accessed once!"),
+            RestartConfig::NoRestart,
+        )
     }
     /// Override to run an action after started but before the first message
     async fn started(&self, _ctx: &Ctx<Self>) {}
@@ -60,14 +62,16 @@ pub enum Interrupt {
     RestartToEscalate,
 }
 
-struct RestartConfig {
-    window: u64,
-    max_restarts: u64,
+pub enum RestartConfig {
+    /// Do not restart on panic. The actor task exits and no escalation is sent.
+    NoRestart,
+    /// Restart up to `max_restarts` times within `window` seconds, then escalate.
+    Restart { window: u64, max_restarts: u64 },
 }
 
 impl Default for RestartConfig {
     fn default() -> Self {
-        Self {
+        Self::Restart {
             window: 5,
             max_restarts: 3,
         }
@@ -156,19 +160,30 @@ where
                     break;
                 }
                 Interrupt::RestartToEscalate => {
-                    is_restart = true;
-                    if first_restart.elapsed().as_secs() > restart_config.window {
-                        restarts = 0;
-                        first_restart = Instant::now();
-                    }
-                    restarts += 1;
-                    if restarts >= restart_config.max_restarts {
-                        eprintln!(
-                            "Actor restarted {} times in {}s, escalating.",
-                            restart_config.max_restarts, restart_config.window
-                        );
-                        let _ = escalate_to_parent.send(());
-                        break;
+                    match &restart_config {
+                        RestartConfig::NoRestart => {
+                            // Unsupervised: just exit, do not escalate.
+                            break;
+                        }
+                        RestartConfig::Restart {
+                            window,
+                            max_restarts,
+                        } => {
+                            is_restart = true;
+                            if first_restart.elapsed().as_secs() > *window {
+                                restarts = 0;
+                                first_restart = Instant::now();
+                            }
+                            restarts += 1;
+                            if restarts >= *max_restarts {
+                                eprintln!(
+                                    "Actor restarted {} times in {}s, escalating.",
+                                    max_restarts, window
+                                );
+                                let _ = escalate_to_parent.send(());
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -213,11 +228,19 @@ impl<A: Actor> Ctx<A> {
         F: FnMut() -> B + Send + 'static,
         B: Actor,
     {
+        self.spawn_with_config(factory, RestartConfig::default())
+    }
+
+    pub fn spawn_with_config<B, F>(&self, factory: F, config: RestartConfig) -> Addr<B>
+    where
+        F: FnMut() -> B + Send + 'static,
+        B: Actor,
+    {
         let child = start_actor(
             factory,
             self.cancel.child_token(),
             self.child_escalations.clone(),
-            RestartConfig::default(),
+            config,
         );
         self.children.lock().unwrap().push(Arc::new(child.clone()));
         child.address()
